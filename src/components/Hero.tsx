@@ -121,12 +121,12 @@ export const Hero: React.FC<HeroProps> = ({ isIntroFinished }) => {
           </h2>
 
           {/* Bio text */}
-          <p className="text-base sm:text-[17px] text-slate-500 font-normal leading-[1.65] max-w-[430px] mb-8">
+          <p className="text-base sm:text-[17px] text-slate-500 font-normal leading-[1.65] max-w-[430px] lg:max-w-[360px] xl:max-w-[400px] mb-8">
             {personal.bio}
           </p>
 
-          {/* Two CTA Buttons matching mockup */}
-          <div className="flex flex-wrap items-center gap-4 sm:gap-5">
+          {/* Two CTA Buttons: stacked on lg-xl so they never cover the character; side-by-side elsewhere matching mockup */}
+          <div className="flex flex-wrap items-center gap-4 sm:gap-5 lg:flex-col lg:items-start 2xl:flex-row 2xl:items-center">
             {/* Primary CTA */}
             <a
               href={personal.primaryCta.href}

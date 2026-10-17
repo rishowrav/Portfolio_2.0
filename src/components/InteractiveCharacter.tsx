@@ -9,42 +9,141 @@ export const InteractiveCharacter: React.FC = () => {
 
   const [isLoaded, setIsLoaded] = useState(false);
 
-  // References for continuous tracking state
-  const imagesCacheRef = useRef<Map<number, HTMLImageElement>>(new Map());
+  // Fully-decoded frame bitmaps: fetched + validated once, then kept for
+  // instant paints with zero decode churn during interaction.
+  const bitmapsRef = useRef<Map<number, ImageBitmap>>(new Map());
+  // Frames currently being decoded (prevents duplicate work).
+  const decodingRef = useRef<Set<number>>(new Set());
+  // Keep hard references to in-flight <img> elements so the GC can never
+  // collect them mid-decode (another source of partial/corrupt draws).
+  const pendingImagesRef = useRef<HTMLImageElement[]>([]);
+  // Last frame index actually painted — used as last-good-frame fallback.
+  const lastDrawnRef = useRef<number | null>(null);
+
   const currentFrameRef = useRef<number>(portfolioConfig.character.neutralFrame);
   const targetFrameRef = useRef<number>(portfolioConfig.character.neutralFrame);
   const isInteractingRef = useRef<boolean>(false);
   const resetTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Frame URL generator (001 to 160)
+  // Frame URL generator (001 to 160). The ?v= cache-buster forces browsers
+  // to fetch fresh bytes whenever the frame assets are repaired/edited.
   const getFrameUrl = useCallback((frameIndex: number) => {
     const padded = String(Math.round(frameIndex)).padStart(3, "0");
-    return `/facemovement/frame-${padded}.webp`;
+    return `/facemovement/frame-${padded}.webp?v=${portfolioConfig.character.frameVersion}`;
   }, []);
 
-  // Draw current frame on canvas with high-DPI Retina crispness
+  // Snap a frame index to the nearest USABLE frame: clamped to [1,160] and
+  // steered around source frames with cutout-mast holes (config.excludedFrames).
+  // Neighbors are visually identical (same video, 1 frame apart), so the
+  // substitution is imperceptible — but the white blocks are gone.
+  const sanitizeFrame = useCallback((frameIndex: number) => {
+    let rounded = Math.max(1, Math.min(160, Math.round(frameIndex)));
+    const excluded = portfolioConfig.character.excludedFrames;
+    if (!excluded.includes(rounded)) return rounded;
+    for (let step = 1; step <= 160; step++) {
+      if (!excluded.includes(rounded - step) && rounded - step >= 1) return rounded - step;
+      if (!excluded.includes(rounded + step) && rounded + step <= 160) return rounded + step;
+    }
+    return rounded;
+  }, []);
+
+  // Decode a single frame fully, then cache the bitmap. Never throws.
+  //
+  // Loading pipeline: fetch() -> Blob -> createImageBitmap().
+  // - fetch() REJECTS on truncated bodies (Content-Length mismatch), so a
+  //   half-downloaded file can never enter the cache.
+  // - createImageBitmap(blob) decodes the complete bytes off-main-thread and
+  //   REJECTS on invalid data.
+  // Together this makes partially-decoded "white block" frames impossible,
+  // unlike <img> + decode() which may resolve while macroblocks are missing.
+  const loadFrame = useCallback(
+    async (frameIndex: number) => {
+      const rounded = sanitizeFrame(frameIndex);
+      if (bitmapsRef.current.has(rounded) || decodingRef.current.has(rounded)) return;
+      decodingRef.current.add(rounded);
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const w = window as any;
+        if (typeof w.createImageBitmap === "function" && typeof window.fetch === "function") {
+          const res = await window.fetch(getFrameUrl(rounded));
+          if (!res.ok) throw new Error(`frame ${rounded} HTTP ${res.status}`);
+          const blob = await res.blob();
+          if (blob.size === 0) throw new Error(`frame ${rounded} empty body`);
+          const bmp: ImageBitmap = await w.createImageBitmap(blob);
+          if (bmp.width === 0 || bmp.height === 0) {
+            try {
+              bmp.close();
+            } catch {
+              /* noop */
+            }
+            throw new Error(`frame ${rounded} zero-size bitmap`);
+          }
+          bitmapsRef.current.set(rounded, bmp);
+        } else {
+          // Legacy fallback for browsers without fetch/createImageBitmap.
+          const img = new window.Image();
+          pendingImagesRef.current.push(img);
+          try {
+            img.src = getFrameUrl(rounded);
+            if (typeof img.decode === "function") {
+              await img.decode();
+            } else {
+              await new Promise<void>((resolve, reject) => {
+                img.onload = () => resolve();
+                img.onerror = () => reject(new Error("image load failed"));
+              });
+            }
+            const off = document.createElement("canvas");
+            off.width = img.naturalWidth;
+            off.height = img.naturalHeight;
+            if (off.width === 0 || off.height === 0) throw new Error("empty image");
+            const octx = off.getContext("2d");
+            if (!octx) throw new Error("no 2d context");
+            octx.drawImage(img, 0, 0);
+            const bmp: ImageBitmap = await w.createImageBitmap(off);
+            bitmapsRef.current.set(rounded, bmp);
+          } finally {
+            pendingImagesRef.current = pendingImagesRef.current.filter((el) => el !== img);
+          }
+        }
+      } catch {
+        // Ignore: frame simply stays uncached and last-good-frame is used.
+      } finally {
+        decodingRef.current.delete(rounded);
+      }
+    },
+    [getFrameUrl, sanitizeFrame]
+  );
+
+  // Draw a frame on canvas. Draws ONLY fully-decoded bitmaps; if the
+  // requested frame is not ready yet, the last successfully painted frame
+  // is kept on screen (no clear, no flash, no partial image).
   const drawFrame = useCallback((frameIndex: number) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d", { alpha: true });
     if (!ctx) return;
 
-    const rounded = Math.max(1, Math.min(160, Math.round(frameIndex)));
-    let img = imagesCacheRef.current.get(rounded);
-    if (!img || !img.complete) {
-      img = imagesCacheRef.current.get(portfolioConfig.character.neutralFrame);
+    const rounded = sanitizeFrame(frameIndex);
+    let key = rounded;
+    if (!bitmapsRef.current.has(key)) {
+      // Request it for next time, but paint last-good-frame (or nothing yet).
+      if (lastDrawnRef.current === null) return;
+      key = lastDrawnRef.current;
     }
-    if (!img || !img.complete) return;
+    const bmp = bitmapsRef.current.get(key);
+    if (!bmp || bmp.width === 0) return;
 
-    // Clear with fully transparent pixels to avoid ghosting
+    // Skip redundant repaints of the identical bitmap.
+    if (lastDrawnRef.current === key && key === rounded) return;
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Use high quality smoothing to reduce edge artifacts
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
 
     // Aspect ratio fit (anchored strictly to bottom-center)
-    const imgRatio = img.width / img.height;
+    const imgRatio = bmp.width / bmp.height;
     const canvasRatio = canvas.width / canvas.height;
 
     let drawWidth: number;
@@ -64,7 +163,41 @@ export const InteractiveCharacter: React.FC = () => {
       drawY = canvas.height - drawHeight;
     }
 
-    ctx.drawImage(img, drawX, drawY, drawWidth, drawHeight);
+    // Pixel-snap the destination rect: fractional offsets force the sampler
+    // to blend transparent cutout edges with the page behind them, which
+    // produced the faint white fringe on hair / arms during motion.
+    drawX = Math.round(drawX);
+    drawY = Math.round(drawY);
+    drawWidth = Math.round(drawWidth);
+    drawHeight = Math.round(drawHeight);
+
+    ctx.drawImage(bmp, drawX, drawY, drawWidth, drawHeight);
+    lastDrawnRef.current = key;
+
+    // opportunistically start decoding the requested frame if missing
+    if (key !== rounded) void loadFrame(rounded);
+  }, [loadFrame, sanitizeFrame]);
+
+  // Size the canvas backing store to its EXACT displayed size (x device-pixel
+  // ratio). A backing store whose aspect differs from the displayed box forces
+  // the GPU compositor to rescale this repainted-every-frame layer, which
+  // produces intermittent solid-white raster blocks on hair / belt / watch.
+  // Matching backing to display 1:1 removes the rescale — and the blocks.
+  const sizeCanvasToDisplay = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return false;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cw = canvas.clientWidth;
+    const ch = canvas.clientHeight;
+    if (!cw || !ch) return false;
+    const w = Math.max(1, Math.round(cw * dpr));
+    const h = Math.max(1, Math.round(ch * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+      return true; // resized => must repaint (resize clears the canvas)
+    }
+    return false;
   }, []);
 
   // Preload frames progressively (instant neutral frame first)
@@ -72,47 +205,79 @@ export const InteractiveCharacter: React.FC = () => {
     let isCancelled = false;
     const { neutralFrame, leftMaxFrame, rightMaxFrame } = portfolioConfig.character;
 
-    const canvas = canvasRef.current;
-    if (canvas) {
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      // Match frame aspect ratio exactly (1080x1920 = 9:16) to avoid distortion artifacts
-      canvas.width = 540 * dpr;
-      canvas.height = 960 * dpr;
+    // Backing store matches the displayed box exactly (falls back to the
+    // 9:16 frame aspect when layout is not measurable yet).
+    if (!sizeCanvasToDisplay()) {
+      const canvas = canvasRef.current;
+      if (canvas && (canvas.width === 300 || canvas.height === 150)) {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        // Match frame aspect ratio exactly (1080x1920 = 9:16) to avoid distortion artifacts
+        canvas.width = 540 * dpr;
+        canvas.height = 960 * dpr;
+      }
     }
 
-    // 1. Immediately load neutral frame (instant render, zero layout shift)
-    const neutralImg = new window.Image();
-    neutralImg.src = getFrameUrl(neutralFrame);
-    neutralImg.onload = () => {
+    // 1. Immediately decode + render neutral frame (zero layout shift)
+    void (async () => {
+      await loadFrame(neutralFrame);
       if (isCancelled) return;
-      imagesCacheRef.current.set(neutralFrame, neutralImg);
-      setIsLoaded(true);
-      drawFrame(neutralFrame);
-    };
+      if (bitmapsRef.current.has(neutralFrame)) {
+        setIsLoaded(true);
+        drawFrame(neutralFrame);
+      }
+    })();
 
-    // 2. Preload range 40 (left max) to 120 (right max) from center outwards
+    // 2. Preload range 40 (left max) to 120 (right max) from center outwards.
+    // Mask-hole frames are skipped entirely (never fetched, never shown).
+    const { excludedFrames } = portfolioConfig.character;
     const framesToLoad: number[] = [];
     for (let offset = 1; offset <= 40; offset++) {
-      if (neutralFrame - offset >= leftMaxFrame) framesToLoad.push(neutralFrame - offset);
-      if (neutralFrame + offset <= rightMaxFrame) framesToLoad.push(neutralFrame + offset);
+      if (neutralFrame - offset >= leftMaxFrame && !excludedFrames.includes(neutralFrame - offset))
+        framesToLoad.push(neutralFrame - offset);
+      if (neutralFrame + offset <= rightMaxFrame && !excludedFrames.includes(neutralFrame + offset))
+        framesToLoad.push(neutralFrame + offset);
     }
 
     framesToLoad.forEach((frameIdx) => {
-      const img = new window.Image();
-      img.src = getFrameUrl(frameIdx);
-      img.onload = () => {
-        if (isCancelled) return;
-        imagesCacheRef.current.set(frameIdx, img);
-      };
+      void loadFrame(frameIdx);
     });
 
     return () => {
       isCancelled = true;
+      // Allow a re-mounted instance (e.g. React StrictMode double-effects in
+      // dev) to decode frames again instead of being blocked forever.
+      decodingRef.current.clear();
+      pendingImagesRef.current = [];
     };
-  }, [getFrameUrl, drawFrame]);
+  }, [getFrameUrl, drawFrame, loadFrame, sizeCanvasToDisplay]);
+
+  // Keep the backing store glued to the displayed size (responsive resizes,
+  // zoom changes, DPR changes). Repaints the current frame after a resize
+  // since resizing clears the canvas.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || typeof ResizeObserver === "undefined") return;
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        if (sizeCanvasToDisplay()) {
+          lastDrawnRef.current = null;
+          drawFrame(currentFrameRef.current);
+        }
+      });
+    });
+    ro.observe(canvas);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, [sizeCanvasToDisplay, drawFrame]);
 
   // Main 60fps render loop using requestAnimationFrame + lerp
-  // ZERO CSS translation, ZERO layout shift - purely updating canvas pixels
+  // ZERO CSS translation, ZERO layout shift - purely updating canvas pixels.
+  // Repaints only when the rounded frame index actually changes, so two
+  // adjacent frames never shimmer back-and-forth within one stopped pose.
   useEffect(() => {
     let animId: number;
 
@@ -123,7 +288,14 @@ export const InteractiveCharacter: React.FC = () => {
         const frameDiff = targetFrameRef.current - currentFrameRef.current;
         if (Math.abs(frameDiff) > 0.05) {
           currentFrameRef.current += frameDiff * 0.12;
-          drawFrame(currentFrameRef.current);
+          const rounded = sanitizeFrame(currentFrameRef.current);
+          if (rounded !== lastDrawnRef.current) {
+            drawFrame(rounded);
+          }
+        } else if (sanitizeFrame(currentFrameRef.current) !== sanitizeFrame(targetFrameRef.current)) {
+          // Snap to the exact target when close enough, then paint once.
+          currentFrameRef.current = targetFrameRef.current;
+          drawFrame(sanitizeFrame(currentFrameRef.current));
         }
       }
 
@@ -135,7 +307,22 @@ export const InteractiveCharacter: React.FC = () => {
     return () => {
       if (animId) cancelAnimationFrame(animId);
     };
-  }, [drawFrame]);
+  }, [drawFrame, sanitizeFrame]);
+
+  // Release GPU bitmap memory on unmount.
+  useEffect(() => {
+    const cache = bitmapsRef.current;
+    return () => {
+      cache.forEach((bmp) => {
+        try {
+          bmp.close();
+        } catch {
+          /* noop */
+        }
+      });
+      cache.clear();
+    };
+  }, []);
 
   // Full-Screen Pointer & Touch Tracking (Zero layout shift, 100% stable body position)
   useEffect(() => {
@@ -182,7 +369,7 @@ export const InteractiveCharacter: React.FC = () => {
         targetF = neutralFrame + normX * (rightMaxFrame - neutralFrame);
       }
 
-      targetFrameRef.current = targetF;
+      targetFrameRef.current = sanitizeFrame(targetF);
     };
 
     const resetToNeutral = () => {
@@ -190,7 +377,7 @@ export const InteractiveCharacter: React.FC = () => {
         clearTimeout(resetTimerRef.current);
         resetTimerRef.current = null;
       }
-      targetFrameRef.current = portfolioConfig.character.neutralFrame;
+      targetFrameRef.current = sanitizeFrame(portfolioConfig.character.neutralFrame);
       isInteractingRef.current = false;
     };
 
@@ -238,12 +425,12 @@ export const InteractiveCharacter: React.FC = () => {
       document.removeEventListener("mouseout", onDocumentMouseOut);
       if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
     };
-  }, []);
+  }, [sanitizeFrame]);
 
   return (
     <div
       ref={containerRef}
-      className="relative flex items-end justify-center w-[340px] sm:w-[440px] md:w-[500px] lg:w-[560px] xl:w-[600px] h-[480px] sm:h-[580px] md:h-[660px] lg:h-[740px] xl:h-[780px] select-none pointer-events-none"
+      className="relative flex items-end justify-center w-[340px] sm:w-[440px] md:w-[500px] lg:w-[380px] xl:w-[520px] 2xl:w-[600px] h-[480px] sm:h-[580px] md:h-[660px] lg:h-[620px] xl:h-[700px] 2xl:h-[780px] select-none pointer-events-none"
     >
       {/* Organic Soft-Blue Backdrop Blob matching mockup exactly */}
       <div

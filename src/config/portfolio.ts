@@ -37,7 +37,13 @@ export interface PortfolioConfig {
     leftMaxFrame: number;
     rightMaxFrame: number;
     framePattern: string; // e.g. "/facemovement/frame-{index}.webp"
+    frameVersion: string; // cache-buster appended as ?v= to frame URLs
     tiltFactor: number;
+    // Frames with cutout-mask holes in the source assets (transparent chunks
+    // where hair / belt should be — they flash as white blocks). Verified by
+    // neighbor-frame alpha analysis + visual mask inspection. The animation
+    // snaps these to the nearest clean frame (visually identical neighbor).
+    excludedFrames: number[];
   };
   meta: {
     title: string;
@@ -86,7 +92,19 @@ export const portfolioConfig: PortfolioConfig = {
     leftMaxFrame: 40, // Frame 40 is looking furthest to our left
     rightMaxFrame: 120, // Frame 120 is looking furthest to our right
     framePattern: "/facemovement/frame-{index}.webp",
+    // Bump this string every time the frame image files are edited. It is
+    // appended as a ?v= query so browsers/CDNs fetch fresh bytes instead of
+    // serving stale cached copies of the old (holey) frames.
+    frameVersion: "v2",
     tiltFactor: 8, // Degrees of 3D tilt
+    // Frames with cutout-mask holes in the source assets (transparent chunks
+    // where hair / belt / chin should be — they flash as white blocks).
+    // The holes were repaired in the image files themselves (pixels filled
+    // from neighboring video frames), so most frames play directly.
+    // Frames 83-87 stay excluded: their renders still trip a white block on
+    // the hair (source bytes verify clean), so the animation shows the
+    // identical neighbors 82/88 instead (5-frame gap, imperceptible).
+    excludedFrames: [83, 84, 85, 86, 87],
   },
   meta: {
     title: "Rahimul Islam Showrav | Frontend Developer",
